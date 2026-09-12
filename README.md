@@ -1,30 +1,22 @@
-# Celeborn
-Celeborn is a Userland API Unhooker that I developed for learning Windows APIs and Syscall implementations. It mainly detects and patches hooking instructions in NTDLL.dll file. All PRs are welcome!
+# ntclean
 
+![ntclean: Windows API research](assets/project-mark.svg)
 
-# How It Works?
+A Windows API research fork derived from Celeborn. Its source explores loaded-module inspection and modification.
 
-Celeborn takes the hooked NTDLL.dll module from the in-memory module list that exists in PEB structure (specifically, LoaderData member), parses its export directory to detect hooked functions. To do that, it traverses all Nt related functions, and check their first four bytes. If they are not `0x4C,0x8B,0xD1,0xB8`, the tool itself qualifies them as hooked and started to patch them.
+Maintained by [unrandoms](https://github.com/unrandoms), derived from [frkngksl/Celeborn](https://github.com/frkngksl/Celeborn).
 
-To get a fresh and unhooked NTDLL.dll file, Celeborn loads the file as a section and maps as an image. While patching a function, it copies the first 24 bytes of the clear function address (after parsing the export directory again), and overwrites the hooked one.
+## Fork-specific work
 
-Before unhooking the functions, I defined predefined syscalls in the assembly format because I realized that functions that are used for unhooking process might be also hooked. During patching and detecting, Celeborn is using these predefined arbitrary syscall functions.
+- [`Main.cpp`](Main.cpp)
+- [`Structs.h`](Structs.h)
 
-# TO-DO List
-- Generic Predefined Syscall Numbers
-- More silent techniques (especially for newly created section)
-- Refactor
+## Validation and limits
 
-# References
+This project changes process memory. No claim of reliability, invisibility or production readiness is made. Its Windows runtime has not been validated in this review.
 
-I used different techniques from the following tools for both silence and learning.
+This documentation update does not certify all inherited features. The [archived reference](UPSTREAM_README.md) describes the original ecosystem; its package names and release links may target upstream rather than this fork.
 
-- https://outflank.nl/blog/2019/06/19/red-team-tactics-combining-direct-system-calls-and-srdi-to-bypass-av-edr/
-- https://www.ired.team/miscellaneous-reversing-forensics/windows-kernel-internals/pe-file-header-parser-in-c++
-- https://github.com/Mr-Un1k0d3r/EDRs
-- https://blog.malwarebytes.com/threat-analysis/2018/08/process-doppelganging-meets-process-hollowing_osiris/
-- https://github.com/am0nsec/HellsGate
+## Credits
 
-# Disclaimer
-
-For authorized security testing only. Misuse of this tool against systems without explicit permission is illegal.
+See [CREDITS.md](CREDITS.md) for the distinction between the original implementation and this fork's adaptations. Original licenses and copyright notices remain in the repository.
