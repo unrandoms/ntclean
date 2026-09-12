@@ -8,32 +8,25 @@
 
 /*--------------------------------------------------------------------
   DYNAMIC SYSCALL TABLE  (Task 1 - Hell's Gate)
-  Populated at runtime from the clean on-disk NTDLL copy so that SSNs
-  are always correct regardless of Windows version or patch level.
 --------------------------------------------------------------------*/
 static SYSCALL_ENTRY g_SyscallTable[MAX_SYSCALL_ENTRIES];
 static DWORD         g_SyscallCount = 0;
-static PBYTE         g_StubPool     = NULL; /* RWX allocation holding all stubs */
+static PBYTE         g_StubPool     = NULL;
 
-/* Write an 11-byte x64 syscall stub at dst for the given SSN.
-   Layout: mov r10,rcx  |  mov eax,ssn  |  syscall  |  ret        */
 static void WriteStub(PBYTE dst, WORD ssn) {
-	dst[0]  = 0x4C; dst[1]  = 0x8B; dst[2]  = 0xD1; /* mov r10, rcx        */
-	dst[3]  = 0xB8;                                   /* mov eax, imm32 ...  */
+	dst[0]  = 0x4C; dst[1]  = 0x8B; dst[2]  = 0xD1;
+	dst[3]  = 0xB8;
 	dst[4]  = (BYTE)(ssn & 0xFF);
 	dst[5]  = (BYTE)((ssn >> 8) & 0xFF);
 	dst[6]  = 0x00;
-	dst[7]  = 0x00;                                   /* ... imm32 high word */
-	dst[8]  = 0x0F; dst[9]  = 0x05;                  /* syscall             */
-	dst[10] = 0xC3;                                   /* ret                 */
+	dst[7]  = 0x00;
+	dst[8]  = 0x0F; dst[9]  = 0x05;
+	dst[10] = 0xC3;
 }
 
-/* Enumerate Nt* exports in the clean NTDLL section, extract each SSN
-   from the "mov eax, SSN" at function offset +4, and emit a dynamic
-   stub into the pre-allocated RWX pool.                             */
 static BOOL BuildSyscallTable(PBYTE cleanBase) {
-	PIMAGE_DOS_HEADER      dosHdr  = (PIMAGE_DOS_HEADER)cleanBase;
-	PIMAGE_NT_HEADERS      ntHdrs  = (PIMAGE_NT_HEADERS)(cleanBase + dosHdr->e_lfanew);
+	PIMAGE_DOS_HEADER       dosHdr = (PIMAGE_DOS_HEADER)cleanBase;
+	PIMAGE_NT_HEADERS       ntHdrs = (PIMAGE_NT_HEADERS)(cleanBase + dosHdr->e_lfanew);
 	PIMAGE_EXPORT_DIRECTORY expDir = (PIMAGE_EXPORT_DIRECTORY)(cleanBase +
 		ntHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 	PDWORD nameRva  = (PDWORD)(cleanBase + expDir->AddressOfNames);
@@ -56,17 +49,11 @@ static BOOL BuildSyscallTable(PBYTE cleanBase) {
 			continue;
 
 		PBYTE fnBytes = cleanBase + funcRva[ordinals[i]];
-
-		/* Verify this is a genuine syscall stub:
-		   offset 0-2 = 4C 8B D1 (mov r10, rcx)
-		   offset 3   = B8       (mov eax, imm32)           */
 		if (fnBytes[0] != 0x4C || fnBytes[1] != 0x8B ||
 		    fnBytes[2] != 0xD1 || fnBytes[3] != 0xB8)
 			continue;
 
-		/* SSN is the little-endian WORD at offset 4 (the imm16 of mov eax) */
 		WORD ssn = *(WORD*)(fnBytes + 4);
-
 		PSYSCALL_ENTRY entry = &g_SyscallTable[g_SyscallCount];
 		strncpy_s(entry->name, sizeof(entry->name), funcName, _TRUNCATE);
 		entry->ssn  = ssn;
@@ -81,7 +68,6 @@ static BOOL BuildSyscallTable(PBYTE cleanBase) {
 	return g_SyscallCount > 0;
 }
 
-/* Return the RWX stub pointer for a named Nt* function, or NULL.   */
 PVOID GetSyscallStub(const char* name) {
 	for (DWORD i = 0; i < g_SyscallCount; i++) {
 		if (strcmp(g_SyscallTable[i].name, name) == 0)
@@ -91,7 +77,19 @@ PVOID GetSyscallStub(const char* name) {
 }
 
 /*--------------------------------------------------------------------
-  HELPERS retained from the original codebase
+  MULTI-DLL TARGET ARRAY  (Task 2)
+  Add a new DLL by appending one entry to this array.
+  name_prefix = NULL means compare all exported functions.
+--------------------------------------------------------------------*/
+static target_dll_t g_targets[] = {
+	{ "ntdll.dll",      L"ntdll.dll",      "Nt", FALSE, NULL, NULL, {0} },
+	{ "kernelbase.dll", L"KernelBase.dll", NULL, FALSE, NULL, NULL, {0} },
+	{ "win32u.dll",     L"win32u.dll",     "Nt", FALSE, NULL, NULL, {0} },
+};
+#define TARGET_COUNT ((DWORD)(sizeof(g_targets) / sizeof(g_targets[0])))
+
+/*--------------------------------------------------------------------
+  HELPERS
 --------------------------------------------------------------------*/
 PTEB RtlGetThreadEnvironmentBlock() {
 #if _WIN64
@@ -114,7 +112,7 @@ void printBanner() {
 	std::cout << banner << std::endl;
 }
 
-/* Returns 0 when the function should be skipped (not a real Nt stub) */
+/* Returns 0 when the function is in the skip list (not a real Nt syscall stub) */
 int nameException(const char* functionName) {
 	const char* listOfNames[] = {
 		"NtGetTickCount","NtQuerySystemTime",
@@ -128,27 +126,26 @@ int nameException(const char* functionName) {
 	return 1;
 }
 
-bool replaceTheContentOfFunction(const PCHAR funcNameForUnhook, PBYTE destinationAddress, PBYTE cleanNTDLLModule) {
-	PBYTE imageBaseAddressOfNTDLL = (PBYTE)cleanNTDLLModule;
-	PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)imageBaseAddressOfNTDLL;
-	PIMAGE_NT_HEADERS imageNTHeaders = (PIMAGE_NT_HEADERS)(imageBaseAddressOfNTDLL + dosHeader->e_lfanew);
-	PIMAGE_EXPORT_DIRECTORY imageExportDirectory = (PIMAGE_EXPORT_DIRECTORY)(imageBaseAddressOfNTDLL + imageNTHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-	PDWORD nameArray = (PDWORD)(imageBaseAddressOfNTDLL + imageExportDirectory->AddressOfNames);
-	PWORD ordinalArray = (PWORD)(imageBaseAddressOfNTDLL + imageExportDirectory->AddressOfNameOrdinals);
-	PDWORD addressArray = (PDWORD)(imageBaseAddressOfNTDLL + imageExportDirectory->AddressOfFunctions);
-	PCHAR functionNameTemp;
-	PBYTE functionAddrTemp;
-	bool fixedOrNot = false;
-	for (unsigned int i = 0; i < imageExportDirectory->NumberOfNames; i++) {
-		functionNameTemp = (PCHAR)(imageBaseAddressOfNTDLL + nameArray[i]);
-		functionAddrTemp = (PBYTE)(imageBaseAddressOfNTDLL + addressArray[ordinalArray[i]]);
-		if (strncmp(functionNameTemp, funcNameForUnhook, strlen(funcNameForUnhook)) == 0) {
-			memcpy(destinationAddress,functionAddrTemp,24);
-			fixedOrNot = (destinationAddress[0] == 0x4C && destinationAddress[1] == 0x8B && destinationAddress[2] == 0xD1 && destinationAddress[3] == 0xB8);
-			break;
-		}
+/* Find a named export in a clean DLL image and return its address.
+   Returns NULL if the name is not found.                           */
+static PBYTE FindInClean(PBYTE cleanBase, const char* funcName) {
+	PIMAGE_DOS_HEADER       dosHdr = (PIMAGE_DOS_HEADER)cleanBase;
+	PIMAGE_NT_HEADERS       ntHdrs = (PIMAGE_NT_HEADERS)(cleanBase + dosHdr->e_lfanew);
+	PIMAGE_EXPORT_DIRECTORY expDir = (PIMAGE_EXPORT_DIRECTORY)(cleanBase +
+		ntHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+	PDWORD nameRva  = (PDWORD)(cleanBase + expDir->AddressOfNames);
+	PWORD  ordinals = (PWORD) (cleanBase + expDir->AddressOfNameOrdinals);
+	PDWORD funcRva  = (PDWORD)(cleanBase + expDir->AddressOfFunctions);
+	for (DWORD i = 0; i < expDir->NumberOfNames; i++) {
+		if (strcmp((const char*)(cleanBase + nameRva[i]), funcName) == 0)
+			return cleanBase + funcRva[ordinals[i]];
 	}
-	return fixedOrNot;
+	return NULL;
+}
+
+/* TRUE when the first 5 bytes of both addresses are identical.     */
+static BOOL PrologueMatchesClean(PBYTE liveAddr, PBYTE cleanAddr) {
+	return memcmp(liveAddr, cleanAddr, 5) == 0;
 }
 
 PVOID loadModuleAsSection(UNICODE_STRING * dllPath) {
@@ -168,111 +165,190 @@ PVOID loadModuleAsSection(UNICODE_STRING * dllPath) {
 		FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, 0x1, 0x00000020, NULL, 0);
 
 	if (ntdllHandle == INVALID_HANDLE_VALUE || status != 0) {
-		std::cout << "[ERROR] Cannot open the clean version" << std::endl;
-		exit(1);
+		std::cout << "[ERROR] Cannot open the clean version of " << std::endl;
+		return NULL;
 	}
 
 	status = NtCreateSectionArbitrary(&hSection, SECTION_ALL_ACCESS,NULL,0, PAGE_READONLY, SEC_IMAGE,ntdllHandle);
 
 	if (status != 0) {
 		std::cout << "[ERROR] Cannot create a section" << std::endl;
-		exit(1);
+		CloseHandle(ntdllHandle);
+		return NULL;
 	}
 	status = ZwMapViewOfSectionArbitrary(hSection, GetCurrentProcess(), &sectionBaseAddress, NULL, NULL, NULL, &viewSize, ViewShare, NULL, PAGE_READONLY);
 
 	if (status != 0x40000003){
-		std::cout << "[ERROR] Cannot map the section failed" << std::endl;
-		exit(1);
+		std::cout << "[ERROR] Cannot map the section" << std::endl;
+		CloseHandle(hSection);
+		CloseHandle(ntdllHandle);
+		return NULL;
 	}
 
-	std::cout << "[DONE] New section is created for clean " << std::endl;
+	std::cout << "[DONE] Clean section mapped at 0x" << std::hex << (ULONG_PTR)sectionBaseAddress << std::endl;
 	CloseHandle(hSection);
 	CloseHandle(ntdllHandle);
 	return sectionBaseAddress;
 }
 
+/*--------------------------------------------------------------------
+  UnhookDll  (Task 2)
+  Generalised unhook loop operating on any target_dll_t.
+  Iterates the live module's export table, compares each function's
+  live prologue to the clean on-disk copy, and patches any that differ.
+  A single ZwProtectVirtualMemory call covers the whole .text section
+  so protection is changed only once per DLL.
+--------------------------------------------------------------------*/
+UNHOOK_STATS UnhookDll(target_dll_t* target) {
+	UNHOOK_STATS stats = {0};
+	PBYTE liveBase  = target->live_base;
+	PBYTE cleanBase = (PBYTE)target->clean_mapping;
+
+	/* Parse the LIVE module's export directory to enumerate targets. */
+	PIMAGE_DOS_HEADER       dosHdr = (PIMAGE_DOS_HEADER)liveBase;
+	PIMAGE_NT_HEADERS       ntHdrs = (PIMAGE_NT_HEADERS)(liveBase + dosHdr->e_lfanew);
+	PIMAGE_EXPORT_DIRECTORY expDir = (PIMAGE_EXPORT_DIRECTORY)(liveBase +
+		ntHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+	PDWORD nameRva  = (PDWORD)(liveBase + expDir->AddressOfNames);
+	PWORD  ordinals = (PWORD) (liveBase + expDir->AddressOfNameOrdinals);
+	PDWORD funcRva  = (PDWORD)(liveBase + expDir->AddressOfFunctions);
+
+	/* Locate the .text section to change its protection in one call. */
+	PIMAGE_SECTION_HEADER sects = (PIMAGE_SECTION_HEADER)(
+		(PBYTE)ntHdrs + sizeof(IMAGE_NT_HEADERS));
+	PIMAGE_SECTION_HEADER textSect = NULL;
+	for (WORD s = 0; s < ntHdrs->FileHeader.NumberOfSections; s++) {
+		if (strcmp((const char*)sects[s].Name, ".text") == 0) {
+			textSect = &sects[s];
+			break;
+		}
+	}
+	if (!textSect) {
+		std::cout << "[ERROR] No .text section found in " << target->dll_name << std::endl;
+		return stats;
+	}
+
+	ULONG  oldProtect   = 0;
+	LPVOID lpBase       = liveBase + textSect->VirtualAddress;
+	SIZE_T sectionBytes = (SIZE_T)textSect->Misc.VirtualSize;
+	NTSTATUS status = ZwProtectVirtualMemoryArbitrary(GetCurrentProcess(),
+		&lpBase, &sectionBytes, PAGE_EXECUTE_READWRITE, &oldProtect);
+	if (status != 0) {
+		std::cout << "[ERROR] Cannot change .text permissions for "
+		          << target->dll_name << " (0x" << std::hex << status << ")" << std::endl;
+		return stats;
+	}
+
+	/* Compare live vs clean prologues and patch hooks. */
+	for (DWORD i = 0; i < expDir->NumberOfNames; i++) {
+		const char* funcName = (const char*)(liveBase + nameRva[i]);
+		PBYTE       liveAddr = liveBase + funcRva[ordinals[i]];
+
+		/* Prefix filter: skip if name does not match the required prefix. */
+		if (target->name_prefix &&
+		    strncmp(funcName, target->name_prefix, strlen(target->name_prefix)) != 0)
+			continue;
+
+		/* ntdll-specific: skip functions that are never syscall stubs. */
+		if (strcmp(target->dll_name, "ntdll.dll") == 0 && !nameException(funcName))
+			continue;
+
+		PBYTE cleanAddr = FindInClean(cleanBase, funcName);
+		if (!cleanAddr)
+			continue;
+
+		if (!PrologueMatchesClean(liveAddr, cleanAddr)) {
+			stats.total_checked++;
+			std::cout << "[WARNING] Potential hook in " << target->dll_name
+			          << " : " << funcName << std::endl;
+
+			memcpy(liveAddr, cleanAddr, 24);
+
+			if (PrologueMatchesClean(liveAddr, cleanAddr)) {
+				std::cout << "[SUCCESS] Unhooked " << target->dll_name
+				          << " : " << funcName << std::endl;
+				stats.unhooked++;
+			} else {
+				std::cout << "[FAILED]  Unhook failed in " << target->dll_name
+				          << " : " << funcName << std::endl;
+				stats.failed++;
+			}
+		}
+	}
+
+	/* Restore original protection. */
+	ZwProtectVirtualMemoryArbitrary(GetCurrentProcess(),
+		&lpBase, &sectionBytes, oldProtect, &oldProtect);
+
+	return stats;
+}
+
 
 int main(int argc, char** argv) {
 	printBanner();
+
 	PTEB pCurrentTeb = RtlGetThreadEnvironmentBlock();
 	PPEB pCurrentPeb = pCurrentTeb->ProcessEnvironmentBlock;
 	if (!pCurrentPeb || !pCurrentTeb || pCurrentPeb->OSMajorVersion != 0xA)
-		return 0;
-	PVOID newSectionForNTDLL;
-	PLDR_DATA_TABLE_ENTRY ntdllModule = NULL;
-	PLIST_ENTRY beginningOfTheList = &pCurrentPeb->LoaderData->InMemoryOrderModuleList;
-	PLIST_ENTRY cursorOfModules = beginningOfTheList->Flink;
-	PLDR_DATA_TABLE_ENTRY currentModule;
-	int count = 0;
-	while (cursorOfModules != beginningOfTheList) {
-		currentModule = (PLDR_DATA_TABLE_ENTRY) ((PBYTE)cursorOfModules - 0x10);
-		if (wcscmp(currentModule->BaseDllName.Buffer, L"ntdll.dll") == 0) {
-			std::cout << "[FOUND] Loaded Module Index of NTDLL.dll is " << count << std::endl;
-			ntdllModule = currentModule;
-		}
-		count++;
-		cursorOfModules = cursorOfModules->Flink;
-	}
-	if (ntdllModule) {
-		newSectionForNTDLL = loadModuleAsSection(&ntdllModule->FullDllName);
+		return 1;
 
-		/* --- Task 1: Build dynamic SSN table from the clean NTDLL copy --- */
-		BuildSyscallTable((PBYTE)newSectionForNTDLL);
-
-		PBYTE imageBaseAddressOfNTDLL = (PBYTE) ntdllModule->DllBase;
-		PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)imageBaseAddressOfNTDLL;
-		PIMAGE_NT_HEADERS imageNTHeaders = (PIMAGE_NT_HEADERS)(imageBaseAddressOfNTDLL + dosHeader->e_lfanew);
-		PIMAGE_EXPORT_DIRECTORY imageExportDirectory = (PIMAGE_EXPORT_DIRECTORY)(imageBaseAddressOfNTDLL + imageNTHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-		PDWORD nameArray = (PDWORD) (imageBaseAddressOfNTDLL + imageExportDirectory->AddressOfNames);
-		PWORD ordinalArray = (PWORD) (imageBaseAddressOfNTDLL + imageExportDirectory->AddressOfNameOrdinals);
-		PDWORD addressArray = (PDWORD) (imageBaseAddressOfNTDLL + imageExportDirectory->AddressOfFunctions);
-		PCHAR functionName;
-		PBYTE functionAddr;
-		PIMAGE_SECTION_HEADER textSection = (PIMAGE_SECTION_HEADER) (((PBYTE)imageNTHeaders) + sizeof(IMAGE_NT_HEADERS));
-		for (unsigned int i = 0; i < imageNTHeaders->FileHeader.NumberOfSections; i++) {
-			if (strcmp((const char *)textSection[i].Name,".text") == 0) {
-				std::cout << "[FOUND] Text Section Found" << std::endl;
-				textSection = &textSection[i];
-				break;
+	/* ---- Traverse PEB to locate all target DLLs ---- */
+	PLIST_ENTRY head   = &pCurrentPeb->LoaderData->InMemoryOrderModuleList;
+	PLIST_ENTRY cursor = head->Flink;
+	int moduleIdx = 0;
+	while (cursor != head) {
+		PLDR_DATA_TABLE_ENTRY entry =
+			(PLDR_DATA_TABLE_ENTRY)((PBYTE)cursor - 0x10);
+		for (DWORD t = 0; t < TARGET_COUNT; t++) {
+			if (!g_targets[t].is_loaded &&
+			    _wcsicmp(entry->BaseDllName.Buffer, g_targets[t].dll_wname) == 0) {
+				g_targets[t].is_loaded  = TRUE;
+				g_targets[t].live_base  = (PBYTE)entry->DllBase;
+				g_targets[t].full_path  = entry->FullDllName;
+				std::cout << "[FOUND] " << g_targets[t].dll_name
+				          << " at module index " << moduleIdx << std::endl;
 			}
 		}
+		moduleIdx++;
+		cursor = cursor->Flink;
+	}
 
-		ULONG oldProtection = 0;
-		LPVOID lpBaseAddress = imageBaseAddressOfNTDLL + textSection->VirtualAddress;
-		SIZE_T sizeOfSection= textSection->Misc.VirtualSize;
-		bool returnFlag;
-		NTSTATUS status = ZwProtectVirtualMemoryArbitrary(GetCurrentProcess(), &lpBaseAddress, &sizeOfSection, PAGE_EXECUTE_READWRITE, &oldProtection);
-		if (status != 0) {
-			std::cout << "[ERROR] Cannot change the permission of Text Section" << std::endl;
-			exit(0);
+	/* ---- Create clean on-disk section mappings ---- */
+	for (DWORD t = 0; t < TARGET_COUNT; t++) {
+		if (!g_targets[t].is_loaded) {
+			std::cout << "[SKIP] " << g_targets[t].dll_name
+			          << " not found in PEB, skipping" << std::endl;
+			continue;
 		}
-
-		for (unsigned int i = 0; i < imageExportDirectory->NumberOfNames; i++) {
-			functionName = (PCHAR)( imageBaseAddressOfNTDLL + nameArray[i]);
-			functionAddr = (PBYTE)(imageBaseAddressOfNTDLL + addressArray[ordinalArray[i]]);
-			if (strncmp(functionName, "Nt", 2) == 0){
-				if (!(functionAddr[0] == 0x4C && functionAddr[1] == 0x8B && functionAddr[2] == 0xD1 && functionAddr[3] == 0xB8) && nameException(functionName)) {
-					std::cout << "[WARNING] Potential Hook : " << functionName << std::endl;
-					returnFlag = replaceTheContentOfFunction(functionName, functionAddr,(PBYTE) newSectionForNTDLL);
-					if (returnFlag) {
-						std::cout << "[SUCCESS] Unhook success for " << functionName << std::endl;
-					}
-					else {
-						std::cout << "[FAILED] Unhook failed for " << functionName << std::endl;
-					}
-				}
-			}
-		}
-
-		status = ZwProtectVirtualMemoryArbitrary(GetCurrentProcess(), &lpBaseAddress, &sizeOfSection, oldProtection, &oldProtection);
-		if (status != 0) {
-			std::cout << "[ERROR] Cannot restore the permission of Text Section" << std::endl;
-			exit(0);
+		g_targets[t].clean_mapping = loadModuleAsSection(&g_targets[t].full_path);
+		if (!g_targets[t].clean_mapping) {
+			std::cout << "[WARN] Could not map clean copy of "
+			          << g_targets[t].dll_name << std::endl;
 		}
 	}
-	else {
-		std::cout << "[ERROR] Cannot Find NTDLL.dll" << std::endl;
+
+	/* ---- Build dynamic SSN table from clean NTDLL (index 0) ---- */
+	if (g_targets[0].is_loaded && g_targets[0].clean_mapping)
+		BuildSyscallTable((PBYTE)g_targets[0].clean_mapping);
+
+	/* ---- Unhook each DLL ---- */
+	int totalUnhooked = 0, totalFailed = 0;
+	for (DWORD t = 0; t < TARGET_COUNT; t++) {
+		if (!g_targets[t].is_loaded || !g_targets[t].clean_mapping)
+			continue;
+		std::cout << "\n[---] Unhooking " << g_targets[t].dll_name << " ..." << std::endl;
+		UNHOOK_STATS us = UnhookDll(&g_targets[t]);
+		totalUnhooked += us.unhooked;
+		totalFailed   += us.failed;
+		std::cout << "[" << g_targets[t].dll_name << "] "
+		          << std::dec << us.total_checked << " hooked, "
+		          << us.unhooked << " patched, "
+		          << us.failed   << " failed" << std::endl;
 	}
+
+	std::cout << "\n[SUMMARY] Total unhooked: " << std::dec << totalUnhooked
+	          << " | Total failed: " << totalFailed << std::endl;
+
 	std::cout << "Press a key to continue ..." << std::endl;
 	_getch();
 	return 0;
