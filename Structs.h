@@ -374,8 +374,61 @@ FORCEINLINE VOID RtlInitUnicodeString(
 	DestinationString->Buffer = SourceString;
 }
 
+/*--------------------------------------------------------------------
+  DYNAMIC SYSCALL TABLE  (Task 1 - Hell's Gate SSN resolution)
+  One entry per Nt* export found in the clean NTDLL section.
+--------------------------------------------------------------------*/
+#define MAX_SYSCALL_ENTRIES 512
+#define SYSCALL_STUB_SIZE   11   /* 4C 8B D1  B8 xx xx 00 00  0F 05  C3 */
 
+typedef struct _SYSCALL_ENTRY {
+	char  name[128]; /* Exported function name, e.g. "NtCreateFile"   */
+	WORD  ssn;       /* System Service Number extracted from clean copy */
+	PVOID stub;      /* Pointer into RWX stub pool for this function    */
+} SYSCALL_ENTRY, *PSYSCALL_ENTRY;
+
+/*--------------------------------------------------------------------
+  MULTI-DLL TARGET DESCRIPTOR  (Task 2)
+  One record per DLL to unhook.  Adding a new DLL is one array line.
+--------------------------------------------------------------------*/
+typedef struct _TARGET_DLL {
+	const char*    dll_name;      /* ASCII name used for console output, e.g. "ntdll.dll"    */
+	const wchar_t* dll_wname;     /* Wide name matched against PEB BaseDllName                */
+	const char*    name_prefix;   /* Export-name prefix filter; NULL means all exports        */
+	BOOL           is_loaded;     /* Set to TRUE once located in the PEB module list          */
+	PVOID          clean_mapping; /* Base of the read-only on-disk section mapping            */
+	PBYTE          live_base;     /* Base of the live (potentially hooked) in-memory module   */
+	UNICODE_STRING full_path;     /* FullDllName from the LDR entry (Buffer is LDR-owned)     */
+} target_dll_t, *Ptarget_dll_t;
+
+/*--------------------------------------------------------------------
+  UNHOOK / VERIFY STATISTICS  (Tasks 2 & 3)
+--------------------------------------------------------------------*/
+typedef struct _UNHOOK_STATS {
+	int total_checked; /* Exports where live prologue differed from clean  */
+	int unhooked;      /* Successfully patched back to clean bytes         */
+	int failed;        /* Patch applied but prologue still differs         */
+} UNHOOK_STATS;
+
+#define MAX_STILL_HOOKED 64
+
+typedef struct _VERIFY_STATS {
+	int  verified_clean;                        /* Prologues that match clean after unhooking    */
+	int  still_hooked;                          /* Prologues that still differ after unhooking   */
+	char still_hooked_names[MAX_STILL_HOOKED][128]; /* Names of functions still hooked (capped) */
+} VERIFY_STATS;
+
+/*--------------------------------------------------------------------
+  STATIC SYSCALL STUBS  (predefinedSyscalls.asm fallback)
+  STATIC_SYSCALLS is set in the project preprocessor definitions so
+  that the hand-written ASM stubs are always linked for bootstrap
+  operations (NtCreateFile, NtCreateSection, etc.) which must work
+  before the clean NTDLL mapping is available.  Remove the define
+  only if you supply an alternative bootstrap mechanism.
+--------------------------------------------------------------------*/
+#ifdef STATIC_SYSCALLS
 EXTERN_C NTSTATUS ZwProtectVirtualMemoryArbitrary(IN HANDLE ProcessHandle, IN PVOID* BaseAddress, IN SIZE_T* NumberOfBytesToProtect, IN ULONG NewAccessProtection, OUT PULONG OldAccessProtection);
 EXTERN_C NTSTATUS NtCreateFileArbitrary(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength);
 EXTERN_C NTSTATUS NtCreateSectionArbitrary(PHANDLE SectionHandle,ACCESS_MASK DesiredAccess,POBJECT_ATTRIBUTES ObjectAttributes,PLARGE_INTEGER MaximumSize, ULONG SectionPageProtection, ULONG AllocationAttributes,HANDLE FileHandle);
 EXTERN_C NTSTATUS ZwMapViewOfSectionArbitrary(HANDLE SectionHandle, HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, SECTION_INHERIT InheritDisposition, ULONG AllocationType, ULONG Win32Protect);
+#endif /* STATIC_SYSCALLS */
