@@ -165,7 +165,7 @@ PVOID loadModuleAsSection(UNICODE_STRING * dllPath) {
 		FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, 0x1, 0x00000020, NULL, 0);
 
 	if (ntdllHandle == INVALID_HANDLE_VALUE || status != 0) {
-		std::cout << "[ERROR] Cannot open the clean version of " << std::endl;
+		std::cout << "[ERROR] Cannot open the clean version" << std::endl;
 		return NULL;
 	}
 
@@ -193,18 +193,13 @@ PVOID loadModuleAsSection(UNICODE_STRING * dllPath) {
 
 /*--------------------------------------------------------------------
   UnhookDll  (Task 2)
-  Generalised unhook loop operating on any target_dll_t.
-  Iterates the live module's export table, compares each function's
-  live prologue to the clean on-disk copy, and patches any that differ.
-  A single ZwProtectVirtualMemory call covers the whole .text section
-  so protection is changed only once per DLL.
+  Patches every export whose live prologue differs from the clean copy.
 --------------------------------------------------------------------*/
 UNHOOK_STATS UnhookDll(target_dll_t* target) {
 	UNHOOK_STATS stats = {0};
 	PBYTE liveBase  = target->live_base;
 	PBYTE cleanBase = (PBYTE)target->clean_mapping;
 
-	/* Parse the LIVE module's export directory to enumerate targets. */
 	PIMAGE_DOS_HEADER       dosHdr = (PIMAGE_DOS_HEADER)liveBase;
 	PIMAGE_NT_HEADERS       ntHdrs = (PIMAGE_NT_HEADERS)(liveBase + dosHdr->e_lfanew);
 	PIMAGE_EXPORT_DIRECTORY expDir = (PIMAGE_EXPORT_DIRECTORY)(liveBase +
@@ -213,7 +208,6 @@ UNHOOK_STATS UnhookDll(target_dll_t* target) {
 	PWORD  ordinals = (PWORD) (liveBase + expDir->AddressOfNameOrdinals);
 	PDWORD funcRva  = (PDWORD)(liveBase + expDir->AddressOfFunctions);
 
-	/* Locate the .text section to change its protection in one call. */
 	PIMAGE_SECTION_HEADER sects = (PIMAGE_SECTION_HEADER)(
 		(PBYTE)ntHdrs + sizeof(IMAGE_NT_HEADERS));
 	PIMAGE_SECTION_HEADER textSect = NULL;
@@ -224,7 +218,7 @@ UNHOOK_STATS UnhookDll(target_dll_t* target) {
 		}
 	}
 	if (!textSect) {
-		std::cout << "[ERROR] No .text section found in " << target->dll_name << std::endl;
+		std::cout << "[ERROR] No .text section in " << target->dll_name << std::endl;
 		return stats;
 	}
 
@@ -239,17 +233,14 @@ UNHOOK_STATS UnhookDll(target_dll_t* target) {
 		return stats;
 	}
 
-	/* Compare live vs clean prologues and patch hooks. */
 	for (DWORD i = 0; i < expDir->NumberOfNames; i++) {
 		const char* funcName = (const char*)(liveBase + nameRva[i]);
 		PBYTE       liveAddr = liveBase + funcRva[ordinals[i]];
 
-		/* Prefix filter: skip if name does not match the required prefix. */
 		if (target->name_prefix &&
 		    strncmp(funcName, target->name_prefix, strlen(target->name_prefix)) != 0)
 			continue;
 
-		/* ntdll-specific: skip functions that are never syscall stubs. */
 		if (strcmp(target->dll_name, "ntdll.dll") == 0 && !nameException(funcName))
 			continue;
 
@@ -276,9 +267,59 @@ UNHOOK_STATS UnhookDll(target_dll_t* target) {
 		}
 	}
 
-	/* Restore original protection. */
 	ZwProtectVirtualMemoryArbitrary(GetCurrentProcess(),
 		&lpBase, &sectionBytes, oldProtect, &oldProtect);
+
+	return stats;
+}
+
+/*--------------------------------------------------------------------
+  VerifyDll  (Task 3)
+  After all patching is complete, re-read each qualifying function's
+  live prologue and compare it to the clean copy.  Counts:
+    verified_clean  - prologue now matches the on-disk image
+    still_hooked    - prologue still differs (patch failed or racing EDR)
+  Names of still-hooked functions are recorded (up to MAX_STILL_HOOKED).
+--------------------------------------------------------------------*/
+VERIFY_STATS VerifyDll(target_dll_t* target) {
+	VERIFY_STATS stats = {0};
+	PBYTE liveBase  = target->live_base;
+	PBYTE cleanBase = (PBYTE)target->clean_mapping;
+
+	PIMAGE_DOS_HEADER       dosHdr = (PIMAGE_DOS_HEADER)liveBase;
+	PIMAGE_NT_HEADERS       ntHdrs = (PIMAGE_NT_HEADERS)(liveBase + dosHdr->e_lfanew);
+	PIMAGE_EXPORT_DIRECTORY expDir = (PIMAGE_EXPORT_DIRECTORY)(liveBase +
+		ntHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+	PDWORD nameRva  = (PDWORD)(liveBase + expDir->AddressOfNames);
+	PWORD  ordinals = (PWORD) (liveBase + expDir->AddressOfNameOrdinals);
+	PDWORD funcRva  = (PDWORD)(liveBase + expDir->AddressOfFunctions);
+
+	for (DWORD i = 0; i < expDir->NumberOfNames; i++) {
+		const char* funcName = (const char*)(liveBase + nameRva[i]);
+		PBYTE       liveAddr = liveBase + funcRva[ordinals[i]];
+
+		/* Apply the same filter as UnhookDll for a consistent view. */
+		if (target->name_prefix &&
+		    strncmp(funcName, target->name_prefix, strlen(target->name_prefix)) != 0)
+			continue;
+
+		if (strcmp(target->dll_name, "ntdll.dll") == 0 && !nameException(funcName))
+			continue;
+
+		PBYTE cleanAddr = FindInClean(cleanBase, funcName);
+		if (!cleanAddr)
+			continue;
+
+		if (PrologueMatchesClean(liveAddr, cleanAddr)) {
+			stats.verified_clean++;
+		} else {
+			if (stats.still_hooked < MAX_STILL_HOOKED) {
+				strncpy_s(stats.still_hooked_names[stats.still_hooked],
+				          128, funcName, _TRUNCATE);
+			}
+			stats.still_hooked++;
+		}
+	}
 
 	return stats;
 }
@@ -331,7 +372,7 @@ int main(int argc, char** argv) {
 	if (g_targets[0].is_loaded && g_targets[0].clean_mapping)
 		BuildSyscallTable((PBYTE)g_targets[0].clean_mapping);
 
-	/* ---- Unhook each DLL ---- */
+	/* ---- Unhook pass: patch all hooked functions in every DLL ---- */
 	int totalUnhooked = 0, totalFailed = 0;
 	for (DWORD t = 0; t < TARGET_COUNT; t++) {
 		if (!g_targets[t].is_loaded || !g_targets[t].clean_mapping)
@@ -346,10 +387,45 @@ int main(int argc, char** argv) {
 		          << us.failed   << " failed" << std::endl;
 	}
 
-	std::cout << "\n[SUMMARY] Total unhooked: " << std::dec << totalUnhooked
-	          << " | Total failed: " << totalFailed << std::endl;
+	/* ---- Verification pass: re-read live prologues vs clean ---- */
+	std::cout << "\n[===] Post-unhook verification" << std::endl;
+	int totalVerified = 0, totalStillHooked = 0;
+	for (DWORD t = 0; t < TARGET_COUNT; t++) {
+		if (!g_targets[t].is_loaded || !g_targets[t].clean_mapping)
+			continue;
+		VERIFY_STATS vs = VerifyDll(&g_targets[t]);
+		totalVerified    += vs.verified_clean;
+		totalStillHooked += vs.still_hooked;
+		std::cout << "[" << g_targets[t].dll_name << "] "
+		          << std::dec << vs.verified_clean << " verified clean, "
+		          << vs.still_hooked << " still hooked" << std::endl;
+		/* Report each name that remains hooked (up to the cap). */
+		int reportLimit = (vs.still_hooked < MAX_STILL_HOOKED)
+		                  ? vs.still_hooked : MAX_STILL_HOOKED;
+		for (int k = 0; k < reportLimit; k++) {
+			std::cout << "  [HOOK REMAINS] " << vs.still_hooked_names[k] << std::endl;
+		}
+		if (vs.still_hooked > MAX_STILL_HOOKED) {
+			std::cout << "  ... and " << (vs.still_hooked - MAX_STILL_HOOKED)
+			          << " more (name buffer full)" << std::endl;
+		}
+	}
+
+	/* ---- Final summary ---- */
+	std::cout << "\n[SUMMARY] Unhooked: " << std::dec << totalUnhooked
+	          << " | Verified clean: " << totalVerified
+	          << " | Still hooked: "   << totalStillHooked << std::endl;
+
+	if (totalStillHooked > 0) {
+		std::cout << "[WARN] " << totalStillHooked
+		          << " function(s) remain hooked after patching." << std::endl;
+	} else {
+		std::cout << "[OK] All targeted functions verified clean." << std::endl;
+	}
 
 	std::cout << "Press a key to continue ..." << std::endl;
 	_getch();
-	return 0;
+
+	/* Non-zero exit when any function remains hooked (usable in CI). */
+	return (totalStillHooked > 0) ? 1 : 0;
 }
